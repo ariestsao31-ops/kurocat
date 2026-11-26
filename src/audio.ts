@@ -23,11 +23,14 @@ class CatAudio {
   private keyDownIndex = 0;
   private keyUpIndex = 0;
   private spaceIndex = 0;
+  private growlNodes: AudioNode[] = [];
+  private growlActive = false;
 
   public setEnabled(enabled: boolean): void {
     this.enabled = enabled;
     if (!enabled) {
       this.setPurrIntensity(0);
+      this.stopHandoverGrowl();
     }
   }
 
@@ -90,6 +93,7 @@ class CatAudio {
   }
 
   private teardownGraph(): void {
+    this.stopHandoverGrowl();
     const ctx = this.ctx;
     for (const src of this.sources) {
       try {
@@ -680,6 +684,77 @@ class CatAudio {
       };
     } catch {
       // Never throw on blocked autoplay or missing audio hardware
+    }
+  }
+
+  /**
+   * Continuous low yowl used only while two cats hold the handover standoff.
+   * Respects the global sound toggle. Calling with `false` (or disabling sound) stops it.
+   */
+  public setHandoverGrowl(active: boolean): void {
+    if (!active || !this.enabled) {
+      this.stopHandoverGrowl();
+      return;
+    }
+    if (this.growlActive) return;
+    const ctx = this.getReadyContext();
+    if (!ctx) return;
+    try {
+      const now = ctx.currentTime + 0.02;
+      const master = ctx.createGain();
+      master.gain.setValueAtTime(0.0001, now);
+      master.gain.linearRampToValueAtTime(0.055, now + 0.18);
+      const filter = ctx.createBiquadFilter();
+      filter.type = 'lowpass';
+      filter.frequency.setValueAtTime(520, now);
+      filter.Q.value = 0.7;
+      const lfo = ctx.createOscillator();
+      const lfoGain = ctx.createGain();
+      lfo.frequency.value = 4.6;
+      lfoGain.gain.value = 18;
+      lfo.connect(lfoGain);
+      const nodes: AudioNode[] = [master, filter, lfo, lfoGain];
+      for (const [freq, type, level] of [
+        [92, 'sine', 0.55],
+        [138, 'triangle', 0.42],
+        [146, 'sawtooth', 0.16],
+      ] as const) {
+        const osc = ctx.createOscillator();
+        const g = ctx.createGain();
+        osc.type = type;
+        osc.frequency.setValueAtTime(freq, now);
+        lfoGain.connect(osc.frequency);
+        g.gain.value = level;
+        osc.connect(g);
+        g.connect(filter);
+        osc.start(now);
+        nodes.push(osc, g);
+      }
+      filter.connect(master);
+      master.connect(ctx.destination);
+      lfo.start(now);
+      this.growlNodes = nodes;
+      this.growlActive = true;
+    } catch {
+      this.growlActive = false;
+      this.growlNodes = [];
+    }
+  }
+
+  private stopHandoverGrowl(): void {
+    if (!this.growlActive && this.growlNodes.length === 0) return;
+    this.growlActive = false;
+    const nodes = this.growlNodes;
+    this.growlNodes = [];
+    for (const node of nodes) {
+      try {
+        if (typeof (node as OscillatorNode).stop === 'function' && node instanceof OscillatorNode) {
+          node.stop();
+        }
+        node.disconnect();
+      } catch {
+        // already stopped
+      }
     }
   }
 

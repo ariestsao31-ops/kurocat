@@ -193,6 +193,11 @@ const engine = new KuroCatEngine(canvas);
 engine.onDeepSleep = () => {
   void invoke('trim_idle_memory').catch(() => {});
 };
+engine.onHandoverDone = () => {
+  activateRenderEngine();
+};
+let petAppearanceReady = false;
+let lastAppliedBreed = '';
 
 // Lazy-loaded Three.js 3D engine (NEVER imported when user stays in 2D mode -> +0 MB overhead!)
 let engine3d: KuroCatEngine3D | null = null;
@@ -313,7 +318,7 @@ function shouldWearHeadphonesNow(): boolean {
   return gameActive;
 }
 
-function wants3DNow(): boolean {
+function wants3DBase(): boolean {
   return (
     settings.renderMode !== '2d' &&
     settings.catBreed !== 'dafeiyu' &&
@@ -321,6 +326,49 @@ function wants3DNow(): boolean {
     !isWin7Ulw &&
     !webgl3dUnavailable
   );
+}
+
+function wants3DNow(): boolean {
+  if (engine.handoverBlocks3D()) return false;
+  return wants3DBase();
+}
+
+/**
+ * Breed changes from the in-app chips and from MCP `switch_cat` both land here
+ * (the latter via the `kuro-settings` event). Same-cat reselection does not animate.
+ */
+function presentCat(cat: CatSkinConfig): void {
+  const nextId = cat.id;
+  if (!petAppearanceReady) {
+    engine.setCatAppearance(nextId, cat);
+    engine3d?.setCatSkin(cat);
+    lastAppliedBreed = nextId;
+    petAppearanceReady = true;
+    return;
+  }
+  if (nextId === lastAppliedBreed) {
+    if (!engine.isHandoverActive()) engine.setCatAppearance(nextId, cat);
+    if (engine3d && !engine3d.isHandoverActive()) engine3d.setCatSkin(cat);
+    return;
+  }
+  const from = catList.find((entry) => entry.id === lastAppliedBreed);
+  lastAppliedBreed = nextId;
+  if (!from) {
+    engine.setCatAppearance(nextId, cat);
+    engine3d?.setCatSkin(cat);
+    return;
+  }
+  const play3d =
+    wants3DBase() && from.id !== 'dafeiyu' && cat.id !== 'dafeiyu' && engine3d !== null;
+  if (play3d && engine3d) {
+    if (engine.isHandoverActive()) engine.cancelHandover();
+    engine3d.beginHandover(from, cat, true);
+    engine.setCatAppearance(nextId, cat);
+    return;
+  }
+  if (engine3d?.isHandoverActive()) engine3d.beginHandover(from, cat, false);
+  engine.beginHandover(from, cat, true);
+  if (engine3d && !engine3d.isHandoverActive()) engine3d.setCatSkin(cat);
 }
 
 function syncEngine3DState(): void {
@@ -345,7 +393,7 @@ function syncEngine3DState(): void {
 
   engine3d.showKeyBubbles = settings.showKeyBubbles;
   engine3d.setRenderStyle('3d');
-  if (activeCat) {
+  if (activeCat && !engine3d.isHandoverActive()) {
     engine3d.setCatSkin(activeCat);
   }
   engine3d.setCollar(collar);
@@ -583,7 +631,7 @@ function syncMenuUI(): void {
 
   const fpsCapNum = settings.fpsCap === 30 ? 30 : 0;
   engine.showKeyBubbles = settings.showKeyBubbles;
-  engine.setCatAppearance(activeCat?.id || 'black', activeCat);
+  if (activeCat) presentCat(activeCat);
   engine.setHeadphones(shouldWearHeadphonesNow());
   engine.setKeyboardConfig(kbLayout, kbOrient);
   engine.setTailKeyConfig(tailMode, tailIds);

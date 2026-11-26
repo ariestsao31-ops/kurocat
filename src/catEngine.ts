@@ -8,6 +8,13 @@ import {
   resolveKeyByVk,
 } from './keyboardLayout';
 import { catAudio } from './audio';
+import {
+  HANDOVER_X_2D,
+  handoverInvolvesDafeiyu,
+  sampleHandover,
+  type HandoverActorPose,
+  type HandoverFrame,
+} from './catHandover';
 import { resolveCustomSkin, type CatSkinConfig, type ResolvedSkin } from './catSkins';
 import { DaFeiYuRenderer, type DaFeiYuLayout } from './dafeiyuRenderer';
 
@@ -254,7 +261,19 @@ export class KuroCatEngine {
   public showKeyBubbles = true;
   public privacyMode = false;
   public onAfterRender: (() => void) | null = null;
+  /** Fires once when a breed handover finishes, including a switch back to the cat that was leaving. */
+  public onHandoverDone: (() => void) | null = null;
   public catBreed: CatBreed = 'black';
+  private handover: {
+    t0: number;
+    from: CatSkinConfig;
+    to: CatSkinConfig;
+    audio: boolean;
+    blocks3d: boolean;
+  } | null = null;
+  private handoverFrame: HandoverFrame | null = null;
+  /** Pose of the actor currently being drawn. Null outside a handover draw pass. */
+  private handoverVis: HandoverActorPose | null = null;
   public customSkin: ResolvedSkin | null = null;
   public keyboardLayout: KeyboardLayoutId = '65';
   public keyboardOrientation: KeyboardOrientation = 'cat';
@@ -930,10 +949,63 @@ export class KuroCatEngine {
     if (breedId !== 'dafeiyu' && this.catBreed === 'dafeiyu') {
       this.dafeiyu.releaseSprites();
     }
+    this.assignBreedFields(breedId, skin);
+    if (breedId === 'dafeiyu') catAudio.setPurrIntensity(0);
+    this.syncLayoutPositions();
+    this.wakeAction();
+  }
+
+  public isHandoverActive(): boolean {
+    return this.handover !== null;
+  }
+
+  /** Drop a 2D handover without the completion callback. The caller applies the final skin. */
+  public cancelHandover(): void {
+    const audio = this.handover?.audio === true;
+    this.handover = null;
+    this.handoverFrame = null;
+    this.handoverVis = null;
+    if (audio) catAudio.setHandoverGrowl(false);
+  }
+
+  /** Keep the 2D canvas up while a whale is one of the two cats in the handover. */
+  public handoverBlocks3D(): boolean {
+    return this.handover?.blocks3d === true;
+  }
+
+  /**
+   * Play the two-cat handover from `from` to `to`. Same-id calls are ignored.
+   * A handover already in progress retargets the incoming cat instead of restarting.
+   * Appearance is committed when the timeline finishes so the seated cat does not pop early.
+   */
+  public beginHandover(from: CatSkinConfig, to: CatSkinConfig, audio: boolean): void {
+    if (!from || !to || from.id === to.id) return;
+    if (this.handover) {
+      if (to.id === this.handover.from.id) {
+        this.handover.to = to;
+        this.finishHandover();
+        return;
+      }
+      this.handover.to = to;
+      this.handover.audio = audio;
+      this.handover.blocks3d = handoverInvolvesDafeiyu(this.handover.from.id, to.id);
+      this.wakeAction();
+      return;
+    }
+    this.handover = {
+      t0: performance.now(),
+      from,
+      to,
+      audio,
+      blocks3d: handoverInvolvesDafeiyu(from.id, to.id),
+    };
+    this.wakeAction();
+  }
+
+  private assignBreedFields(breedId: string, skin?: CatSkinConfig | null): void {
     if (breedId === 'dafeiyu') {
       this.catBreed = 'dafeiyu';
       this.customSkin = null;
-      catAudio.setPurrIntensity(0);
     } else if ((breedId === 'black' || breedId === 'ragdoll') && (!skin || skin.builtin)) {
       this.catBreed = breedId;
       this.customSkin = null;
@@ -944,8 +1016,91 @@ export class KuroCatEngine {
       this.catBreed = 'black';
       this.customSkin = null;
     }
-    this.syncLayoutPositions();
-    this.wakeAction();
+  }
+
+  private tickHandover(now: number): void {
+    if (!this.handover) {
+      this.handoverFrame = null;
+      return;
+    }
+    const frame = sampleHandover((now - this.handover.t0) / 1000);
+    if (frame.done) {
+      this.finishHandover();
+      return;
+    }
+    this.handoverFrame = frame;
+    if (this.handover.audio) catAudio.setHandoverGrowl(frame.growl);
+  }
+
+  private finishHandover(): void {
+    const job = this.handover;
+    this.handover = null;
+    this.handoverFrame = null;
+    this.handoverVis = null;
+    if (!job) return;
+    if (job.audio) catAudio.setHandoverGrowl(false);
+    this.setCatAppearance(job.to.id, job.to);
+    this.onHandoverDone?.();
+  }
+
+  private renderHandoverScene(ctx: CanvasRenderingContext2D): void {
+    const frame = this.handoverFrame;
+    const job = this.handover;
+    if (!frame || !job) return;
+    this.drawMiniMouse(ctx);
+    this.drawKeyboard(ctx);
+    // Incoming cat is drawn first so the outgoing cat stays in front during the standoff.
+    this.drawHandoverActor(ctx, job.to, frame.incoming);
+    this.drawHandoverActor(ctx, job.from, frame.outgoing);
+  }
+
+  private drawHandoverActor(ctx: CanvasRenderingContext2D, skin: CatSkinConfig, pose: HandoverActorPose): void {
+    const saved = {
+      breed: this.catBreed,
+      skin: this.customSkin,
+      headTilt: this.headTilt,
+      faceTurnX: this.faceTurnX,
+      typingHunch: this.typingHunch,
+      earX: this.earPerkSpring.x,
+      earV: this.earPerkSpring.v,
+      vis: this.handoverVis,
+    };
+    this.assignBreedFields(skin.id, skin);
+    this.handoverVis = pose;
+    this.headTilt = pose.arch * 0.5;
+    this.faceTurnX = pose.facing * 16;
+    this.typingHunch = pose.arch * 0.85;
+    this.earPerkSpring.x = -0.78 * pose.glare;
+    this.earPerkSpring.v = 0;
+    ctx.save();
+    const bob = Math.sin(pose.gait * Math.PI * 2) * 5.5 * pose.walking;
+    ctx.translate(pose.x * HANDOVER_X_2D, bob - pose.stand * 14);
+    ctx.translate(this.catCenterX, this.catBaseY);
+    ctx.rotate(Math.sin(pose.gait * Math.PI * 2) * 0.035 * pose.walking);
+    ctx.translate(-this.catCenterX, -this.catBaseY);
+    try {
+      if (skin.id === 'dafeiyu') {
+        const now = performance.now();
+        const layout = this.buildDaFeiYuLayout();
+        this.dafeiyu.renderBody(ctx, now, layout, 0);
+        this.dafeiyu.renderForeground(ctx, this.lastDt, now, layout);
+      } else {
+        this.drawTail(ctx);
+        this.drawCatBody(ctx, 0, 0);
+        this.drawPaw(ctx, this.leftPaw, 0);
+        this.drawPaw(ctx, this.rightPaw, 0);
+      }
+    } finally {
+      ctx.restore();
+      this.catBreed = saved.breed;
+      this.customSkin = saved.skin;
+      this.headTilt = saved.headTilt;
+      this.faceTurnX = saved.faceTurnX;
+      this.typingHunch = saved.typingHunch;
+      this.earPerkSpring.x = saved.earX;
+      this.earPerkSpring.v = saved.earV;
+      this.handoverVis = saved.vis;
+    }
   }
 
   public setHeadphones(active: boolean): void {
@@ -1380,7 +1535,8 @@ export class KuroCatEngine {
       Math.abs(this.deskHopY) > 0.15 ||
       Math.abs(this.headsetSpring.v) > 0.02 ||
       Math.abs(this.headsetSpring.x - (this.headphonesOn ? 1 : 0)) > 0.01 ||
-      this.fxParticles.some((fx) => fx.kind !== 'z');
+      this.fxParticles.some((fx) => fx.kind !== 'z') ||
+      this.handover !== null;
     if (hasActiveAction) return 'action';
 
     if (this.sleepAmount > 0.95) return 'sleep';
@@ -1860,6 +2016,10 @@ export class KuroCatEngine {
     const stretchCurveY =
       this.stretchAmount * (-9.5 * shearCurve + 8.5 * Math.sin(t * Math.PI));
     const scruffLiftY = Math.min(1, this.scruffAmount) * (-14 + (t - 0.18) * 16);
+    const hv = this.handoverVis;
+    const standLift = hv ? -hv.stand * (8 + 26 * shearCurve) : 0;
+    const archDrop = hv ? hv.arch * 12 * shearCurve : 0;
+    const faceShear = hv ? hv.facing * 18 * shearCurve : 0;
     const hunchY =
       (this.typingHunch * 13 + this.bodyBob * 3.2 + breath) * shearCurve +
       swayDipY +
@@ -1873,8 +2033,8 @@ export class KuroCatEngine {
     // Slight forward drop when leaning deeply to the mouse
     const leanDropY = Math.abs(this.spineLean) * 6 * shearCurve;
     return {
-      x: this.catCenterX + leanX,
-      y: this.catTopY + t * this.catHeight + hunchY + leanDropY,
+      x: this.catCenterX + leanX + faceShear,
+      y: this.catTopY + t * this.catHeight + hunchY + leanDropY + standLift + archDrop,
     };
   }
 
@@ -2536,6 +2696,7 @@ export class KuroCatEngine {
   // ---- Simulation update ----
 
   private update(dt: number, now: number): void {
+    this.tickHandover(now);
     this.elapsed += dt;
 
     // Cross-platform lost-MouseUp safety fallback (Fixes #4 on macOS/Linux/web; Windows also reconciles via GetAsyncKeyState)
@@ -3052,7 +3213,9 @@ export class KuroCatEngine {
     this.squintAmount += (wantSquint - this.squintAmount) * (1 - Math.exp(-12 * dt));
     const wantPrivacy = this.privacyMode ? 1 : 0;
     this.privacyClose += (wantPrivacy - this.privacyClose) * (1 - Math.exp(-14 * dt));
-    if (this.catBreed !== 'dafeiyu' && !this.privacyMode && !scruffWanted) {
+    if (this.handover) {
+      catAudio.setPurrIntensity(0);
+    } else if (this.catBreed !== 'dafeiyu' && !this.privacyMode && !scruffWanted) {
       if (this.chinAmount > 0.25) {
         catAudio.setPurrIntensity(this.chinAmount, 'chin');
       } else if (this.petEnergy > 0.3 && this.squintAmount > 0.25) {
@@ -3498,6 +3661,12 @@ export class KuroCatEngine {
     ctx.translate(offsetX, offsetY);
     ctx.scale(uniformScale, uniformScale);
 
+    if (this.handoverFrame && this.handover) {
+      this.renderHandoverScene(ctx);
+      ctx.restore();
+      return;
+    }
+
     const breath = Math.sin(this.breathPhase) * (1.0 + this.sleepAmount * 0.65);
     const purrShift = this.squintAmount > 0.4 ? Math.sin(this.elapsed * 22) * 0.45 * this.squintAmount : 0;
 
@@ -3875,10 +4044,23 @@ export class KuroCatEngine {
       restEndY += (startY + 18 - restEndY) * tr;
     }
 
+    // Handover standoff holds the tail up in a tense curl. It does not slap the desk.
+    const hvTail = this.handoverVis;
+    if (hvTail && hvTail.arch > 0.01) {
+      const a = hvTail.arch;
+      const sway = Math.sin(hvTail.gait * 1.3) * 12 * a;
+      restCp1X += (startX + 20 - restCp1X) * a;
+      restCp1Y += (startY - 40 - restCp1Y) * a;
+      restCp2X += (startX + 36 + sway * 0.4 - restCp2X) * a;
+      restCp2Y += (startY - 86 - restCp2Y) * a;
+      restEndX += (startX + 8 + sway - restEndX) * a;
+      restEndY += (startY - 74 - restEndY) * a;
+    }
+
     // Grumpy 3-beat desk-thump pose when cross (lifts up smoothly, slams down onto desk!)
     const r = Math.max(0, Math.min(1, this.catTail.reach));
     const smoothR = r * r * (3 - 2 * r);
-    const thumpBlend = this.crossAmount * (1 - smoothR);
+    const thumpBlend = hvTail ? 0 : this.crossAmount * (1 - smoothR);
     if (thumpBlend > 0.01) {
       const lift = this.thumpLift;
       const lash = this.thumpLash;
@@ -4798,12 +4980,15 @@ export class KuroCatEngine {
     );
     const curious = Math.min(1, this.curiousAmount);
     const scruff = Math.min(1, this.scruffAmount);
-    const cross = this.crossAmount;
+    const cross = Math.max(this.crossAmount, this.handoverVis?.glare ?? 0);
 
     // Exact measured eye spacing & size from original 0.3s & 10.6s!
     const eyeXs = [cx - 23.0, cx + 23.0];
     const rx = (14.8 + this.typingHunch * 1.0) * (1 + curious * 0.06 + scruff * 0.09);
-    const ry = (13.4 - this.typingHunch * 0.5) * (1 + curious * 0.09 + scruff * 0.13);
+    const ry =
+      (13.4 - this.typingHunch * 0.5) *
+      (1 + curious * 0.09 + scruff * 0.13) *
+      (1 - (this.handoverVis?.glare ?? 0) * 0.62);
 
     for (let idx = 0; idx < 2; idx++) {
       const ex = eyeXs[idx];
@@ -6693,13 +6878,16 @@ export class KuroCatEngine {
     );
     const curious = Math.min(1, this.curiousAmount);
     const scruff = Math.min(1, this.scruffAmount);
-    const cross = this.crossAmount;
+    const cross = Math.max(this.crossAmount, this.handoverVis?.glare ?? 0);
     const contour = s.contour;
     const eScale = contour.eyeScale;
     const eAspect = contour.eyeAspect;
     const eyeXs = [cx - 23.0 * contour.eyeSpacing, cx + 23.0 * contour.eyeSpacing];
     const rx = (14.8 * eScale + this.typingHunch * 1.0) * (1 + curious * 0.06 + scruff * 0.09);
-    const ry = (13.4 * eScale * eAspect - this.typingHunch * 0.5) * (1 + curious * 0.09 + scruff * 0.13);
+    const ry =
+      (13.4 * eScale * eAspect - this.typingHunch * 0.5) *
+      (1 + curious * 0.09 + scruff * 0.13) *
+      (1 - (this.handoverVis?.glare ?? 0) * 0.62);
 
     for (let idx = 0; idx < 2; idx++) {
       const side: -1 | 1 = idx === 0 ? -1 : 1;

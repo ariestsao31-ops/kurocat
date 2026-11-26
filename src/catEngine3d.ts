@@ -9,6 +9,7 @@ import type { KeyboardLayoutId } from './keyboardLayout';
 import type { CatHitZone, KeyboardOrientation, PeekEdge, TailKeyMode } from './catEngine';
 import { DEFAULT_TAIL_KEY_IDS } from './catEngine';
 import { catAudio } from './audio';
+import { HANDOVER_X_3D, sampleHandover, type HandoverActorPose } from './catHandover';
 import {
   FurShaderSystem,
   resolveFurPalette3D,
@@ -74,6 +75,14 @@ interface Fx3D {
   dur: number;
   size: number;
   baseX: number;
+}
+
+interface OutgoingActor {
+  group: THREE.Group;
+  head: THREE.Object3D | null;
+  ears: Array<{ obj: THREE.Object3D; side: -1 | 1 }>;
+  eyes: THREE.ShaderMaterial[];
+  bodyMats: THREE.ShaderMaterial[];
 }
 
 interface IdleAct3D {
@@ -143,6 +152,20 @@ function createCleanLimb(
       });
     },
   };
+}
+
+function disposeHandoverGraph(root: THREE.Object3D): void {
+  const geos = new Set<THREE.BufferGeometry>();
+  const mats = new Set<THREE.Material>();
+  root.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (!mesh.isMesh) return;
+    if (mesh.geometry) geos.add(mesh.geometry);
+    if (Array.isArray(mesh.material)) mesh.material.forEach((material) => mats.add(material));
+    else if (mesh.material) mats.add(mesh.material);
+  });
+  geos.forEach((geometry) => geometry.dispose());
+  mats.forEach((material) => material.dispose());
 }
 
 function withTowardEye(mat: THREE.Material, lift: number): THREE.Material {
@@ -830,6 +853,10 @@ export class KuroCatEngine3D {
 
   // State machine
   private currentSkin: CatSkinConfig | null = null;
+  private handover: { t0: number; from: CatSkinConfig; to: CatSkinConfig; audio: boolean } | null = null;
+  private hvIncoming: HandoverActorPose | null = null;
+  private hvOutgoing: HandoverActorPose | null = null;
+  private outgoing: OutgoingActor | null = null;
   private currentPalette: FurPalette3D | null = null;
   private renderStyle: RenderStyle3D = '3d';
   private collarId: CollarColorId = 'none';
@@ -1055,6 +1082,7 @@ export class KuroCatEngine3D {
     this.bodyGeo.setAttribute('rest', this.bodyGeo.attributes.position.clone());
 
     this.bodyMesh = new THREE.Mesh(this.bodyGeo, this.furSystem.createMaterial('CAT_BODY'));
+    this.bodyMesh.name = 'kuro-body';
     this.bodyMesh.frustumCulled = false;
     this.catRoot.add(this.bodyMesh);
     this.petMeshes.push(this.bodyMesh);
@@ -1127,6 +1155,7 @@ export class KuroCatEngine3D {
     this.catRoot.add(this.collarGroup);
 
     // 4) Head Mount (tracks exact head center y=HEAD_CY inside continuous body mesh!)
+    this.headMount.name = 'kuro-head';
     this.headMount.position.set(0, HEAD_CY, 0);
     this.catRoot.add(this.headMount);
 
@@ -1134,6 +1163,8 @@ export class KuroCatEngine3D {
     this.earGeo = this.buildEarGeometry('cat');
     for (const s of [-1, 1] as const) {
       const g = new THREE.Group();
+      g.name = 'kuro-ear';
+      g.userData.earSide = s;
       g.position.set(s * 0.295, 0.255, -0.015);
       g.rotation.set(-0.06, 0, -s * 0.06);
       g.scale.set(1.0, 1.04, 1.0);
@@ -1153,6 +1184,7 @@ export class KuroCatEngine3D {
       const eyeGeo = this.makeCurvedFacePatchGeo(lx, ly, EYE_MAX_RX, EYE_MAX_RY, 0.024, 20);
       const eyeMat = createEyeShaderMaterial(s);
       const eyeMesh = new THREE.Mesh(eyeGeo, eyeMat);
+      eyeMesh.name = 'kuro-eye';
       eyeMesh.renderOrder = 10;
 
       // Gentle U-shaped closed arc for sleep / password privacy / blink
@@ -2327,6 +2359,7 @@ export class KuroCatEngine3D {
       this.elapsed - this.lastInput < 3.0 ||
       this.elapsed - this.cursorActiveAt < 2.4 ||
       this.isCross ||
+      this.handover !== null ||
       this.petting ||
       this.idleAct !== null ||
       this.scruffAmt > 0.02 ||
@@ -2440,6 +2473,168 @@ export class KuroCatEngine3D {
       e.mat.uniforms.uPupilShape.value = pupilShapeCode;
       e.mat.uniforms.uIs3D.value = this.renderStyle === '3d' ? 1.0 : 0.0;
       e.mat.uniforms.uLimbalAmt.value = p.isDarkFur ? 0.22 : 0.56;
+    }
+  }
+
+  public isHandoverActive(): boolean {
+    return this.handover !== null;
+  }
+
+  /**
+   * Snapshot the cat currently on screen, then show `to` as the cat walking in.
+   * Dafeiyu has no 3D body, so that pair is left to the 2D engine.
+   */
+  public beginHandover(from: CatSkinConfig, to: CatSkinConfig, audio: boolean): void {
+    if (!from || !to || from.id === to.id) return;
+    if (from.id === 'dafeiyu' || to.id === 'dafeiyu') {
+      this.finishHandover();
+      this.setCatSkin(to);
+      return;
+    }
+    if (this.handover) {
+      if (to.id === this.handover.from.id) {
+        const back = this.handover.from;
+        this.finishHandover();
+        this.setCatSkin(back);
+        return;
+      }
+      this.handover.to = to;
+      this.handover.audio = audio;
+      this.setCatSkin(to);
+      this.lastInput = this.elapsed;
+      this.wakeRendering();
+      return;
+    }
+    const actor = this.captureOutgoingActor();
+    if (!actor) {
+      this.setCatSkin(to);
+      return;
+    }
+    this.outgoing = actor;
+    this.scene.add(actor.group);
+    this.handover = { t0: this.elapsed, from, to, audio };
+    this.setCatSkin(to);
+    this.lastInput = this.elapsed;
+    this.wakeRendering();
+  }
+
+  private finishHandover(): void {
+    const audio = this.handover?.audio === true;
+    const actor = this.outgoing;
+    this.handover = null;
+    this.hvIncoming = null;
+    this.hvOutgoing = null;
+    this.outgoing = null;
+    if (audio) catAudio.setHandoverGrowl(false);
+    if (actor) {
+      this.scene.remove(actor.group);
+      disposeHandoverGraph(actor.group);
+    }
+    this.catRoot.rotation.y = 0;
+  }
+
+  private tickHandover(): void {
+    if (!this.handover) {
+      this.hvIncoming = null;
+      this.hvOutgoing = null;
+      return;
+    }
+    const frame = sampleHandover(this.elapsed - this.handover.t0);
+    if (frame.done) {
+      this.finishHandover();
+      return;
+    }
+    this.hvIncoming = frame.incoming;
+    this.hvOutgoing = frame.outgoing;
+    if (this.handover.audio) catAudio.setHandoverGrowl(frame.growl);
+    this.asleep = false;
+    this.isCross = false;
+    this.idleAct = null;
+    this.paws.L.down = false;
+    this.paws.R.down = false;
+    this.paws.L.keyId = null;
+    this.paws.R.keyId = null;
+    this.tailTap.down = false;
+    this.tailTap.keyId = null;
+  }
+
+  private captureOutgoingActor(): OutgoingActor | null {
+    try {
+      const group = new THREE.Group();
+      group.name = 'handover-outgoing';
+      group.add(this.cloneSkinnedGraph(this.catRoot));
+      const limbs: THREE.Object3D[] = [this.tailLimb.fill.mesh, ...this.tailLimb.caps];
+      for (const arm of this.arms) {
+        limbs.push(arm.limb.fill.mesh, ...arm.limb.caps, arm.paw);
+      }
+      for (const src of limbs) {
+        group.attach(this.cloneSkinnedGraph(src));
+      }
+      const actor: OutgoingActor = { group, head: null, ears: [], eyes: [], bodyMats: [] };
+      group.traverse((obj) => {
+        if (obj.name === 'kuro-head') actor.head = obj;
+        if (obj.name === 'kuro-ear') {
+          const side = Number(obj.userData.earSide);
+          actor.ears.push({ obj, side: side < 0 ? -1 : 1 });
+        }
+        const mesh = obj as THREE.Mesh;
+        if (!mesh.isMesh || Array.isArray(mesh.material) || !mesh.material) return;
+        const shader = mesh.material as THREE.ShaderMaterial;
+        if (!shader.uniforms) return;
+        if (obj.name === 'kuro-body' && shader.uniforms.uBend) actor.bodyMats.push(shader);
+        if (obj.name === 'kuro-eye' && shader.uniforms.uScale) actor.eyes.push(shader);
+      });
+      return actor;
+    } catch (err) {
+      console.warn('KuroCat handover capture failed', err);
+      return null;
+    }
+  }
+
+  private cloneSkinnedGraph(src: THREE.Object3D): THREE.Object3D {
+    const dst = src.clone(false);
+    const srcMesh = src as THREE.Mesh;
+    const dstMesh = dst as THREE.Mesh;
+    if (srcMesh.isMesh) {
+      dstMesh.geometry = srcMesh.geometry.clone();
+      if (Array.isArray(srcMesh.material)) {
+        dstMesh.material = srcMesh.material.map((material) => material.clone());
+      } else if (srcMesh.material) {
+        dstMesh.material = srcMesh.material.clone();
+      }
+    }
+    for (const child of src.children) {
+      dst.add(this.cloneSkinnedGraph(child));
+    }
+    return dst;
+  }
+
+  private applyOutgoingPose(pose: HandoverActorPose): void {
+    const actor = this.outgoing;
+    if (!actor) return;
+    const bob = Math.abs(Math.sin(pose.gait * Math.PI * 2)) * 0.045 * pose.walking;
+    actor.group.position.set(pose.x * HANDOVER_X_3D, pose.stand * 0.2 + bob, 0.05);
+    actor.group.rotation.set(
+      0,
+      -pose.facing * 0.82,
+      Math.sin(pose.gait * Math.PI * 2) * 0.05 * pose.walking,
+    );
+    if (actor.head) {
+      actor.head.rotation.set(0.36 * pose.arch - 0.04, -pose.facing * 0.28, 0, 'YXZ');
+    }
+    for (const ear of actor.ears) {
+      const fold = pose.glare;
+      ear.obj.rotation.z = -ear.side * (0.06 + fold * 0.78);
+      ear.obj.rotation.x = -0.06 - fold * 0.18;
+    }
+    for (const mat of actor.bodyMats) {
+      (mat.uniforms.uBend.value as THREE.Vector4).set(0, 0.32 * pose.arch, -0.22 * pose.stand, 0);
+      (mat.uniforms.uHeadRot.value as THREE.Vector3).set(0.36 * pose.arch, -pose.facing * 0.28, 0);
+    }
+    const ry = Math.max(0.12, (0.136 / EYE_MAX_RY) * (1 - pose.glare * 0.74));
+    for (const mat of actor.eyes) {
+      (mat.uniforms.uScale.value as THREE.Vector2).set(0.156 / EYE_MAX_RX, ry);
+      mat.uniforms.uCross.value = pose.glare * 0.92;
     }
   }
 
@@ -3355,6 +3550,7 @@ export class KuroCatEngine3D {
   private update(dt: number): void {
     this.elapsed += dt;
     const t = this.elapsed;
+    this.tickHandover();
 
     // 1) Camera smooth 360° turntable framing (gently faces straight front during Edge-Peek so paws stay flush!)
     const az = (this.sOrbitAz.step(this.orbitAzimuthTarget, dt) * Math.PI) / 180;
@@ -3464,7 +3660,7 @@ export class KuroCatEngine3D {
       chinActive ||
       this.petting ||
       (this.idleAct !== null && ['doze', 'yawn', 'stretch', 'groom', 'knead'].includes(this.idleAct.kind));
-    if (!this.asleep && !this.privacyMode && !blockingSleep && idleSec > sleepAfterSec) {
+    if (!this.hvIncoming && !this.asleep && !this.privacyMode && !blockingSleep && idleSec > sleepAfterSec) {
       this.asleep = true;
       this.isCross = false;
       this.idleAct = null;
@@ -3497,7 +3693,10 @@ export class KuroCatEngine3D {
     const curious = clamp(this.sCurious.step(curiousNow ? 1 : 0, dt), 0, 1);
 
     // Grumpy annoyance state
-    if (!this.privacyMode && !this.asleep && !scruffWanted) {
+    if (this.hvIncoming) {
+      this.isCross = false;
+      this.annoy = 0;
+    } else if (!this.privacyMode && !this.asleep && !scruffWanted) {
       if (cps > 8.5) {
         this.pokeAnnoy((cps - 8.5) * 0.055 * dt);
       } else if (this.isCross && t - this.lastKey < 0.9 && cps >= 4) {
@@ -3525,6 +3724,7 @@ export class KuroCatEngine3D {
     // Calm idle fidgets & feline life vignettes (doze, yawn, stretch, groom, knead!)
     if (this.idleAct && t > this.idleAct.t0 + this.idleAct.dur) this.idleAct = null;
     if (
+      !this.hvIncoming &&
       !this.idleAct &&
       !this.asleep &&
       !this.privacyMode &&
@@ -3720,9 +3920,14 @@ export class KuroCatEngine3D {
 
     // Suppress lateral spine-lean (e.g. mousing -0.24) during sideways ±1.28 rad Edge-Peek so it NEVER
     // rotates into an asymmetric ±29px vertical head shift that strands one paw and buries the other!
-    this.bend.x = this.sShift.step(targetShift * peekCalm, dt) * peekCalm;
-    this.bend.z = this.sHunch.step(targetHunch * peekCalm, dt) * peekCalm;
-    this.bend.squash = this.sSquash.step(targetSquash, dt);
+    const hvPose = this.hvIncoming;
+    const shiftIn = hvPose ? 0 : targetShift * peekCalm;
+    const shiftOut = hvPose ? 1 : peekCalm;
+    const hunchIn = hvPose ? 0.32 * hvPose.arch : targetHunch * peekCalm;
+    const squashIn = hvPose ? -0.22 * hvPose.stand : targetSquash;
+    this.bend.x = this.sShift.step(shiftIn, dt) * shiftOut;
+    this.bend.z = this.sHunch.step(hunchIn, dt) * shiftOut;
+    this.bend.squash = this.sSquash.step(squashIn, dt);
     this.bend.bellySwell =
       (this.sleepAmt * 0.095 + (typingActive ? 0.035 : 0) - scruff * 0.16 - this.stretchAmt * 0.05) * peekCalm;
 
@@ -3760,6 +3965,19 @@ export class KuroCatEngine3D {
       this.catRoot.rotation.z = baseRotZ;
     }
     const scruffSwingClamped = clamp(this.scruffSwing, -1.6, 1.6);
+    if (this.hvIncoming) {
+      const pose = this.hvIncoming;
+      const bob = Math.abs(Math.sin(pose.gait * Math.PI * 2)) * 0.045 * pose.walking;
+      this.catRoot.position.set(
+        this.homePos.x + pose.x * HANDOVER_X_3D,
+        this.homePos.y + pose.stand * 0.2 + bob,
+        this.homePos.z,
+      );
+      this.catRoot.rotation.y = -pose.facing * 0.82;
+      this.catRoot.rotation.z = Math.sin(pose.gait * Math.PI * 2) * 0.05 * pose.walking;
+    } else {
+      this.catRoot.rotation.y = 0;
+    }
     for (const hp of this.hindPaws) {
       hp.mesh.visible = peek < 0.30;
       hp.mesh.position.set(
@@ -3859,6 +4077,15 @@ export class KuroCatEngine3D {
     const wakeEl = t - this.wakeAt;
     const wakeShake = wakeEl >= 0 && wakeEl < 0.55 ? Math.sin(wakeEl * 36) * 0.20 * (1 - wakeEl / 0.55) : 0;
 
+    if (this.hvIncoming) {
+      const pose = this.hvIncoming;
+      targetYaw = -pose.facing * 0.28;
+      targetPitch = 0.36 * pose.arch - 0.04 * (1 - pose.arch);
+      targetRoll = Math.sin(pose.gait * Math.PI * 2) * 0.04 * pose.walking;
+      targetGazeX = -pose.facing * 0.4;
+      targetGazeY = -0.42 * pose.arch;
+    }
+
     this.headRot.pitch = this.sPitch.step(targetPitch, dt);
     this.headRot.yaw = this.sYaw.step(targetYaw, dt);
     this.headRot.roll = this.sRoll.step(targetRoll, dt) + wakeShake + this.boopShake;
@@ -3926,7 +4153,8 @@ export class KuroCatEngine3D {
       0.22 * scruff -
       0.24 * this.yawnAmt -
       0.20 * this.stretchAmt -
-      0.10 * this.sleepAmt;
+      0.10 * this.sleepAmt -
+      (this.hvIncoming ? this.hvIncoming.glare * 0.7 : 0);
     const earState = this.sEars.step(earTarget, dt);
     const earFlick = act && act.kind === 'ear' ? Math.sin(actU * Math.PI * 2) * 0.22 : 0;
     for (const e of this.ears) {
@@ -3973,7 +4201,9 @@ export class KuroCatEngine3D {
     if (this.blushMat.opacity < 0.004 && blushGoal === 0) this.blushMat.opacity = 0;
     const showBlush = this.blushMat.opacity > 0.004;
 
-    if (!this.privacyMode && !scruffWanted) {
+    if (this.hvIncoming) {
+      catAudio.setPurrIntensity(0);
+    } else if (!this.privacyMode && !scruffWanted) {
       if (this.chinAmt > 0.25) {
         catAudio.setPurrIntensity(this.chinAmt, 'chin');
       } else if (petActive) {
@@ -4002,8 +4232,12 @@ export class KuroCatEngine3D {
         const lidClose = Math.max(blinkClose * 0.8, dozeClose * 0.86);
         const eScale = this.currentContour.eyeScale;
         const eAspect = this.currentContour.eyeAspect;
+        const glare = this.hvIncoming?.glare ?? 0;
         const irisRx = 0.156 * eScale * (1 + curious * 0.06 + scruff * 0.09);
-        const irisRy = Math.max(0.018, 0.136 * eScale * eAspect * (1 + curious * 0.09 + scruff * 0.13) * (1 - lidClose));
+        const irisRy = Math.max(
+          0.02,
+          0.136 * eScale * eAspect * (1 + curious * 0.09 + scruff * 0.13) * (1 - lidClose) * (1 - glare * 0.78),
+        );
 
         const boopShrink = 1 - this.boopCrossEye * 0.22;
         const pMul = this.currentContour.pupilScale * eScale;
@@ -4055,7 +4289,7 @@ export class KuroCatEngine3D {
           e.s * -((0.06 + 0.06 * (typingActive ? 1 : 0)) * (1 - scruff * 0.8) + this.currentContour.eyeTilt);
         (e.mat.uniforms.uPupilCenter.value as THREE.Vector2).set(px / irisRx, py / irisRy);
         (e.mat.uniforms.uPupilRad.value as THREE.Vector2).set(pRx / irisRx, pRy / irisRy);
-        e.mat.uniforms.uCross.value = Math.max(cross, this.tailGlanceAmt * 0.42);
+        e.mat.uniforms.uCross.value = Math.max(cross, this.tailGlanceAmt * 0.42, (this.hvIncoming?.glare ?? 0) * 0.95);
         e.mat.uniforms.uCurious.value = Math.max(curious, scruff * 0.55);
         e.mat.uniforms.uShineAmt.value = shineAmt;
       }
@@ -4097,6 +4331,12 @@ export class KuroCatEngine3D {
         tmpTail.copy(this.tailStretchPts[i]);
         tmpTail.x += Math.sin(t * 18) * 0.05 * w * this.stretchAmt;
         pt.lerp(tmpTail, this.stretchAmt);
+      }
+      if (this.hvIncoming && this.hvIncoming.arch > 0.01) {
+        tmpTail.copy(this.tailStretchPts[i]);
+        tmpTail.y += 0.18 * w * this.hvIncoming.arch;
+        tmpTail.x += Math.sin(t * 3.2) * 0.08 * w * this.hvIncoming.arch;
+        pt.lerp(tmpTail, this.hvIncoming.arch);
       }
       if (scruff > 0.01) {
         tmpTail.copy(this.tailScruffPts[i]);
@@ -4391,7 +4631,7 @@ export class KuroCatEngine3D {
       p.sprite.material.opacity = fade;
     }
 
-    if (cross > 0.25) {
+    if (cross > 0.25 && !this.hvIncoming) {
       this.angerSprite.visible = true;
       const pulse = 1 + 0.10 * Math.sin(t * 14) + (t - this.lastSlam < 0.22 ? 0.16 : 0);
       this.headMount.updateMatrixWorld(false);
@@ -4451,5 +4691,7 @@ export class KuroCatEngine3D {
         fx.sprite.material.opacity = (1 - u) * 0.85;
       }
     }
+
+    if (this.hvOutgoing) this.applyOutgoingPose(this.hvOutgoing);
   }
 }
