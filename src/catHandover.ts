@@ -42,35 +42,38 @@ export const HANDOVER_X_2D = 148;
  * Negative facing (the cat on the right) is mirrored.
  * Tuned so the foreheads meet in the middle once the bodies have turned sideways.
  */
-export const HANDOVER_PRESS_X_3D = 0.48;
+export const HANDOVER_PRESS_X_3D = 0.72;
 export const HANDOVER_PRESS_X_2D = 0.16;
 
 /**
- * Positive yaw turns the face toward screen-right.
- * Full standoff is a three-quarter profile so the faces aim at each other
- * without spinning the plush body until only the back shows.
+ * Turn the face toward the other cat.
+ * The face lives on local +Z. A positive Three.js yaw swings that +Z toward screen-right,
+ * so `facing +1` (the cat on the left) must be a positive yaw. The previous negation
+ * pointed both backs at the middle.
  */
 export function handoverYaw(pose: HandoverActorPose): number {
-  // Negated against `facing`: a positive Three.js yaw swings +Z (the face) toward screen-left.
-  return -pose.facing * (0.1 + pose.arch * 1.25);
+  // ~66° at full standoff. Positive yaw swings the face (+Z) toward screen-right,
+  // so the left cat (facing +1) looks right and the right cat looks left.
+  // The old negative sign pointed both backs into the middle.
+  return pose.facing * (0.05 + pose.arch * 1.1);
 }
 
 /** Nod down so the forehead leads, without burying the face in the desk. */
 export function handoverHeadPitch(pose: HandoverActorPose): number {
-  return -0.02 + pose.arch * 0.42;
+  return -0.02 + pose.arch * 0.55;
 }
 
 /** Cock each head toward its rival. */
 export function handoverHeadRoll(pose: HandoverActorPose): number {
-  return -pose.facing * pose.arch * 0.55;
+  return -pose.facing * pose.arch * 0.62;
 }
 
 /**
- * A small inward lean. The yaw does the facing; this only cocks the body.
+ * Lean the crown inward so the foreheads meet while the bellies stay apart.
  * Positive rotation.z tips the crown toward screen-left.
  */
 export function handoverBodyRoll(pose: HandoverActorPose): number {
-  return -pose.facing * pose.arch * 0.22;
+  return -pose.facing * pose.arch * 0.2;
 }
 
 /** Blend the walk offset into the forehead-to-forehead spacing as the standoff locks in. */

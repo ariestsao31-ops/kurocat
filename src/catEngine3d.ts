@@ -2641,7 +2641,7 @@ export class KuroCatEngine3D {
     actor.group.scale.set(1, 1, 1);
     if (actor.head) {
       actor.head.rotation.set(pitch, 0, roll, 'YXZ');
-      actor.head.position.z = 0.06 * press;
+      actor.head.position.z = 0.42 * press;
       actor.head.position.y = HEAD_CY - 0.05 * press;
     }
     for (const ear of actor.ears) {
@@ -2655,10 +2655,10 @@ export class KuroCatEngine3D {
     }
     const hideArms = pose.arch > 0.55;
     for (const arm of actor.arms) arm.visible = !hideArms;
-    const ry = Math.max(0.1, (0.136 / EYE_MAX_RY) * (1 - pose.glare * 0.82));
+    const ry = Math.max(0.16, (0.136 / EYE_MAX_RY) * (1 - pose.glare * 0.45));
     for (const mat of actor.eyes) {
       (mat.uniforms.uScale.value as THREE.Vector2).set(0.156 / EYE_MAX_RX, ry);
-      mat.uniforms.uCross.value = Math.min(1, pose.glare * 1.05);
+      mat.uniforms.uCross.value = pose.glare * 0.55;
     }
   }
 
@@ -4124,7 +4124,7 @@ export class KuroCatEngine3D {
     this.placeHeadAndCollar();
     if (this.hvIncoming && this.hvIncoming.arch > 0.01) {
       const press = this.hvIncoming.arch;
-      this.headMount.position.z += 0.07 * press;
+      this.headMount.position.z += 0.42 * press;
       this.headMount.position.y -= 0.04 * press;
     }
 
@@ -4270,7 +4270,7 @@ export class KuroCatEngine3D {
         const irisRx = 0.156 * eScale * (1 + curious * 0.06 + scruff * 0.09);
         const irisRy = Math.max(
           0.02,
-          0.136 * eScale * eAspect * (1 + curious * 0.09 + scruff * 0.13) * (1 - lidClose) * (1 - glare * 0.78),
+          0.136 * eScale * eAspect * (1 + curious * 0.09 + scruff * 0.13) * (1 - lidClose) * (1 - glare * 0.45),
         );
 
         const boopShrink = 1 - this.boopCrossEye * 0.22;
@@ -4323,7 +4323,7 @@ export class KuroCatEngine3D {
           e.s * -((0.06 + 0.06 * (typingActive ? 1 : 0)) * (1 - scruff * 0.8) + this.currentContour.eyeTilt);
         (e.mat.uniforms.uPupilCenter.value as THREE.Vector2).set(px / irisRx, py / irisRy);
         (e.mat.uniforms.uPupilRad.value as THREE.Vector2).set(pRx / irisRx, pRy / irisRy);
-        e.mat.uniforms.uCross.value = Math.max(cross, this.tailGlanceAmt * 0.42, (this.hvIncoming?.glare ?? 0) * 0.95);
+        e.mat.uniforms.uCross.value = Math.max(cross, this.tailGlanceAmt * 0.42, (this.hvIncoming?.glare ?? 0) * 0.55);
         e.mat.uniforms.uCurious.value = Math.max(curious, scruff * 0.55);
         e.mat.uniforms.uShineAmt.value = shineAmt;
       }
