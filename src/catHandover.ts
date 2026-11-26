@@ -37,6 +37,47 @@ export interface HandoverFrame {
 export const HANDOVER_X_3D = 1.02;
 /** Logical-pixel multiplier for the 2D canvas. */
 export const HANDOVER_X_2D = 148;
+/**
+ * Where each cat's root sits at a full standoff, in timeline units.
+ * Negative facing (the cat on the right) is mirrored.
+ * Tuned so the foreheads meet in the middle once the bodies have turned sideways.
+ */
+export const HANDOVER_PRESS_X_3D = 0.48;
+export const HANDOVER_PRESS_X_2D = 0.16;
+
+/**
+ * Positive yaw turns the face toward screen-right.
+ * Full standoff is a three-quarter profile so the faces aim at each other
+ * without spinning the plush body until only the back shows.
+ */
+export function handoverYaw(pose: HandoverActorPose): number {
+  // Negated against `facing`: a positive Three.js yaw swings +Z (the face) toward screen-left.
+  return -pose.facing * (0.1 + pose.arch * 1.25);
+}
+
+/** Nod down so the forehead leads, without burying the face in the desk. */
+export function handoverHeadPitch(pose: HandoverActorPose): number {
+  return -0.02 + pose.arch * 0.42;
+}
+
+/** Cock each head toward its rival. */
+export function handoverHeadRoll(pose: HandoverActorPose): number {
+  return -pose.facing * pose.arch * 0.55;
+}
+
+/**
+ * A small inward lean. The yaw does the facing; this only cocks the body.
+ * Positive rotation.z tips the crown toward screen-left.
+ */
+export function handoverBodyRoll(pose: HandoverActorPose): number {
+  return -pose.facing * pose.arch * 0.22;
+}
+
+/** Blend the walk offset into the forehead-to-forehead spacing as the standoff locks in. */
+export function handoverPlaceX(pose: HandoverActorPose, pressX: number): number {
+  const press = pose.arch;
+  return pose.x * (1 - press) + -pose.facing * pressX * press;
+}
 
 const ENTER_END = 1.25;
 const STANDOFF_END = 4.45;
@@ -123,7 +164,7 @@ export function sampleHandover(elapsed: number): HandoverFrame {
   return {
     incoming: actor(inX, inStand, arch, inFacing, gait, Math.min(1, inWalk)),
     outgoing: actor(outX, outStand, arch, outFacing, gait + 0.5, outWalk),
-    growl: arch > 0.42,
+    growl: arch > 0.08,
     done: t >= HANDOVER_SECONDS,
   };
 }

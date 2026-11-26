@@ -9,7 +9,17 @@ import type { KeyboardLayoutId } from './keyboardLayout';
 import type { CatHitZone, KeyboardOrientation, PeekEdge, TailKeyMode } from './catEngine';
 import { DEFAULT_TAIL_KEY_IDS } from './catEngine';
 import { catAudio } from './audio';
-import { HANDOVER_X_3D, sampleHandover, type HandoverActorPose } from './catHandover';
+import {
+  HANDOVER_PRESS_X_3D,
+  HANDOVER_X_3D,
+  handoverBodyRoll,
+  handoverHeadPitch,
+  handoverHeadRoll,
+  handoverPlaceX,
+  handoverYaw,
+  sampleHandover,
+  type HandoverActorPose,
+} from './catHandover';
 import {
   FurShaderSystem,
   resolveFurPalette3D,
@@ -83,6 +93,8 @@ interface OutgoingActor {
   ears: Array<{ obj: THREE.Object3D; side: -1 | 1 }>;
   eyes: THREE.ShaderMaterial[];
   bodyMats: THREE.ShaderMaterial[];
+  /** Front paws. Hidden once the foreheads meet so they don't sit between the faces. */
+  arms: THREE.Object3D[];
 }
 
 interface IdleAct3D {
@@ -2563,14 +2575,18 @@ export class KuroCatEngine3D {
       const group = new THREE.Group();
       group.name = 'handover-outgoing';
       group.add(this.cloneSkinnedGraph(this.catRoot));
-      const limbs: THREE.Object3D[] = [this.tailLimb.fill.mesh, ...this.tailLimb.caps];
-      for (const arm of this.arms) {
-        limbs.push(arm.limb.fill.mesh, ...arm.limb.caps, arm.paw);
-      }
-      for (const src of limbs) {
+      for (const src of [this.tailLimb.fill.mesh, ...this.tailLimb.caps]) {
         group.attach(this.cloneSkinnedGraph(src));
       }
-      const actor: OutgoingActor = { group, head: null, ears: [], eyes: [], bodyMats: [] };
+      const arms: THREE.Object3D[] = [];
+      for (const arm of this.arms) {
+        for (const src of [arm.limb.fill.mesh, ...arm.limb.caps, arm.paw]) {
+          const copy = this.cloneSkinnedGraph(src);
+          group.attach(copy);
+          arms.push(copy);
+        }
+      }
+      const actor: OutgoingActor = { group, head: null, ears: [], eyes: [], bodyMats: [], arms };
       group.traverse((obj) => {
         if (obj.name === 'kuro-head') actor.head = obj;
         if (obj.name === 'kuro-ear') {
@@ -2613,28 +2629,36 @@ export class KuroCatEngine3D {
     const actor = this.outgoing;
     if (!actor) return;
     const bob = Math.abs(Math.sin(pose.gait * Math.PI * 2)) * 0.045 * pose.walking;
-    actor.group.position.set(pose.x * HANDOVER_X_3D, pose.stand * 0.2 + bob, 0.05);
-    actor.group.rotation.set(
+    const press = pose.arch;
+    const pitch = handoverHeadPitch(pose);
+    const roll = handoverHeadRoll(pose);
+    actor.group.position.set(
+      handoverPlaceX(pose, HANDOVER_PRESS_X_3D) * HANDOVER_X_3D,
+      pose.stand * 0.08 + bob,
       0,
-      -pose.facing * 0.82,
-      Math.sin(pose.gait * Math.PI * 2) * 0.05 * pose.walking,
     );
+    actor.group.rotation.set(0, handoverYaw(pose), handoverBodyRoll(pose));
+    actor.group.scale.set(1, 1, 1);
     if (actor.head) {
-      actor.head.rotation.set(0.36 * pose.arch - 0.04, -pose.facing * 0.28, 0, 'YXZ');
+      actor.head.rotation.set(pitch, 0, roll, 'YXZ');
+      actor.head.position.z = 0.06 * press;
+      actor.head.position.y = HEAD_CY - 0.05 * press;
     }
     for (const ear of actor.ears) {
       const fold = pose.glare;
-      ear.obj.rotation.z = -ear.side * (0.06 + fold * 0.78);
-      ear.obj.rotation.x = -0.06 - fold * 0.18;
+      ear.obj.rotation.z = -ear.side * (0.06 + fold * 0.9);
+      ear.obj.rotation.x = -0.2 - fold * 0.35;
     }
     for (const mat of actor.bodyMats) {
-      (mat.uniforms.uBend.value as THREE.Vector4).set(0, 0.32 * pose.arch, -0.22 * pose.stand, 0);
-      (mat.uniforms.uHeadRot.value as THREE.Vector3).set(0.36 * pose.arch, -pose.facing * 0.28, 0);
+      (mat.uniforms.uBend.value as THREE.Vector4).set(0, 0.48 * press, -0.16 * pose.stand, 0);
+      (mat.uniforms.uHeadRot.value as THREE.Vector3).set(pitch, 0, roll);
     }
-    const ry = Math.max(0.12, (0.136 / EYE_MAX_RY) * (1 - pose.glare * 0.74));
+    const hideArms = pose.arch > 0.55;
+    for (const arm of actor.arms) arm.visible = !hideArms;
+    const ry = Math.max(0.1, (0.136 / EYE_MAX_RY) * (1 - pose.glare * 0.82));
     for (const mat of actor.eyes) {
       (mat.uniforms.uScale.value as THREE.Vector2).set(0.156 / EYE_MAX_RX, ry);
-      mat.uniforms.uCross.value = pose.glare * 0.92;
+      mat.uniforms.uCross.value = Math.min(1, pose.glare * 1.05);
     }
   }
 
@@ -3969,14 +3993,17 @@ export class KuroCatEngine3D {
       const pose = this.hvIncoming;
       const bob = Math.abs(Math.sin(pose.gait * Math.PI * 2)) * 0.045 * pose.walking;
       this.catRoot.position.set(
-        this.homePos.x + pose.x * HANDOVER_X_3D,
-        this.homePos.y + pose.stand * 0.2 + bob,
+        this.homePos.x + handoverPlaceX(pose, HANDOVER_PRESS_X_3D) * HANDOVER_X_3D,
+        this.homePos.y + pose.stand * 0.08 + bob,
         this.homePos.z,
       );
-      this.catRoot.rotation.y = -pose.facing * 0.82;
-      this.catRoot.rotation.z = Math.sin(pose.gait * Math.PI * 2) * 0.05 * pose.walking;
+      this.catRoot.rotation.y = handoverYaw(pose);
+      this.catRoot.rotation.z =
+        handoverBodyRoll(pose) + Math.sin(pose.gait * Math.PI * 2) * 0.04 * pose.walking;
+      this.catRoot.scale.setScalar(0.9);
     } else {
       this.catRoot.rotation.y = 0;
+      this.catRoot.scale.setScalar(0.9);
     }
     for (const hp of this.hindPaws) {
       hp.mesh.visible = peek < 0.30;
@@ -4079,20 +4106,27 @@ export class KuroCatEngine3D {
 
     if (this.hvIncoming) {
       const pose = this.hvIncoming;
-      targetYaw = -pose.facing * 0.28;
-      targetPitch = 0.36 * pose.arch - 0.04 * (1 - pose.arch);
-      targetRoll = Math.sin(pose.gait * Math.PI * 2) * 0.04 * pose.walking;
-      targetGazeX = -pose.facing * 0.4;
-      targetGazeY = -0.42 * pose.arch;
+      targetYaw = 0;
+      targetPitch = handoverHeadPitch(pose);
+      targetRoll = handoverHeadRoll(pose);
+      targetGazeX = pose.facing * 0.15;
+      targetGazeY = -0.85 * pose.arch;
     }
 
-    this.headRot.pitch = this.sPitch.step(targetPitch, dt);
-    this.headRot.yaw = this.sYaw.step(targetYaw, dt);
-    this.headRot.roll = this.sRoll.step(targetRoll, dt) + wakeShake + this.boopShake;
+    this.headRot.pitch = this.hvIncoming ? targetPitch : this.sPitch.step(targetPitch, dt);
+    this.headRot.yaw = this.hvIncoming ? targetYaw : this.sYaw.step(targetYaw, dt);
+    this.headRot.roll = this.hvIncoming
+      ? targetRoll
+      : this.sRoll.step(targetRoll, dt) + wakeShake + this.boopShake;
 
     // Deform one-piece body+head smoothly & sync headMount + optional collar!
     this.deformCatBody();
     this.placeHeadAndCollar();
+    if (this.hvIncoming && this.hvIncoming.arch > 0.01) {
+      const press = this.hvIncoming.arch;
+      this.headMount.position.z += 0.07 * press;
+      this.headMount.position.y -= 0.04 * press;
+    }
 
     // Sync 3D yawn mouth (drops cleanly downward from upper lip strictly below nose!), groom lick tongue & nose scrunch!
     if (this.yawnAmt > 0.04) {
@@ -4533,6 +4567,20 @@ export class KuroCatEngine3D {
     };
     updatePaw(this.paws.L, true);
     updatePaw(this.paws.R, false);
+
+    if (this.hvIncoming && this.hvIncoming.arch > 0.4) {
+      const yaw = this.catRoot.rotation.y;
+      const back = -0.28 * this.hvIncoming.arch;
+      for (const arm of this.arms) {
+        const paw = arm.s < 0 ? this.paws.L : this.paws.R;
+        paw.tuckWeight = 0;
+        paw.pos.set(
+          this.catRoot.position.x + Math.sin(yaw) * back + Math.cos(yaw) * arm.s * 0.3,
+          0.05,
+          this.catRoot.position.z + Math.cos(yaw) * back - Math.sin(yaw) * arm.s * 0.3,
+        );
+      }
+    }
 
     const scruffBlend = scruff * peekCalm;
     for (const arm of this.arms) {

@@ -1,4 +1,5 @@
 import { TYPING_SOUND_WAV_B64, type TypingSoundSlot } from './typingSoundData';
+import handoverYowlUrl from './assets/handover-yowl.wav';
 
 const KEY_DOWN_SLOTS: readonly TypingSoundSlot[] = ['k0', 'k1', 'k2', 'k3', 'k4', 'k5', 'k6', 'k7'];
 const KEY_UP_SLOTS: readonly TypingSoundSlot[] = ['up0', 'up1', 'up2', 'up3'];
@@ -23,8 +24,12 @@ class CatAudio {
   private keyDownIndex = 0;
   private keyUpIndex = 0;
   private spaceIndex = 0;
-  private growlNodes: AudioNode[] = [];
-  private growlActive = false;
+  private yowlBuffer: AudioBuffer | null = null;
+  private yowlBufferCtx: AudioContext | null = null;
+  private yowlLoading: Promise<AudioBuffer | null> | null = null;
+  private yowlSource: AudioBufferSourceNode | null = null;
+  private yowlGain: GainNode | null = null;
+  private yowlToken = 0;
 
   public setEnabled(enabled: boolean): void {
     this.enabled = enabled;
@@ -688,74 +693,95 @@ class CatAudio {
   }
 
   /**
-   * Continuous low yowl used only while two cats hold the handover standoff.
-   * Respects the global sound toggle. Calling with `false` (or disabling sound) stops it.
+   * Loop the confrontational yowl for the whole handover standoff.
+   * Silent the moment the standoff ends. Respects the global sound toggle.
    */
   public setHandoverGrowl(active: boolean): void {
     if (!active || !this.enabled) {
       this.stopHandoverGrowl();
       return;
     }
-    if (this.growlActive) return;
+    if (this.yowlSource) return;
     const ctx = this.getReadyContext();
     if (!ctx) return;
+    const token = this.yowlToken;
+    void this.ensureYowlBuffer(ctx).then((buf) => {
+      if (!buf || token !== this.yowlToken || !this.enabled || this.yowlSource) return;
+      this.startYowlLoop(ctx, buf);
+    });
+  }
+
+  private ensureYowlBuffer(ctx: AudioContext): Promise<AudioBuffer | null> {
+    if (this.yowlBuffer && this.yowlBufferCtx === ctx) return Promise.resolve(this.yowlBuffer);
+    if (this.yowlLoading && this.yowlBufferCtx === ctx) return this.yowlLoading;
+    this.yowlBuffer = null;
+    this.yowlBufferCtx = ctx;
+    this.yowlLoading = fetch(handoverYowlUrl)
+      .then((res) => {
+        if (!res.ok) throw new Error(`yowl ${res.status}`);
+        return res.arrayBuffer();
+      })
+      .then((ab) => ctx.decodeAudioData(ab.slice(0)))
+      .then((buf) => {
+        if (this.yowlBufferCtx !== ctx) return null;
+        this.yowlBuffer = buf;
+        return buf;
+      })
+      .catch(() => null);
+    return this.yowlLoading;
+  }
+
+  private startYowlLoop(ctx: AudioContext, buf: AudioBuffer): void {
     try {
-      const now = ctx.currentTime + 0.02;
-      const master = ctx.createGain();
-      master.gain.setValueAtTime(0.0001, now);
-      master.gain.linearRampToValueAtTime(0.055, now + 0.18);
-      const filter = ctx.createBiquadFilter();
-      filter.type = 'lowpass';
-      filter.frequency.setValueAtTime(520, now);
-      filter.Q.value = 0.7;
-      const lfo = ctx.createOscillator();
-      const lfoGain = ctx.createGain();
-      lfo.frequency.value = 4.6;
-      lfoGain.gain.value = 18;
-      lfo.connect(lfoGain);
-      const nodes: AudioNode[] = [master, filter, lfo, lfoGain];
-      for (const [freq, type, level] of [
-        [92, 'sine', 0.55],
-        [138, 'triangle', 0.42],
-        [146, 'sawtooth', 0.16],
-      ] as const) {
-        const osc = ctx.createOscillator();
-        const g = ctx.createGain();
-        osc.type = type;
-        osc.frequency.setValueAtTime(freq, now);
-        lfoGain.connect(osc.frequency);
-        g.gain.value = level;
-        osc.connect(g);
-        g.connect(filter);
-        osc.start(now);
-        nodes.push(osc, g);
-      }
-      filter.connect(master);
-      master.connect(ctx.destination);
-      lfo.start(now);
-      this.growlNodes = nodes;
-      this.growlActive = true;
+      const now = ctx.currentTime + 0.01;
+      const gain = ctx.createGain();
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.linearRampToValueAtTime(0.72, now + 0.06);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.loop = true;
+      src.connect(gain);
+      gain.connect(ctx.destination);
+      src.start(now);
+      this.yowlSource = src;
+      this.yowlGain = gain;
     } catch {
-      this.growlActive = false;
-      this.growlNodes = [];
+      this.yowlSource = null;
+      this.yowlGain = null;
     }
   }
 
   private stopHandoverGrowl(): void {
-    if (!this.growlActive && this.growlNodes.length === 0) return;
-    this.growlActive = false;
-    const nodes = this.growlNodes;
-    this.growlNodes = [];
-    for (const node of nodes) {
+    this.yowlToken += 1;
+    const src = this.yowlSource;
+    const gain = this.yowlGain;
+    this.yowlSource = null;
+    this.yowlGain = null;
+    if (!src && !gain) return;
+    const ctx = this.ctx;
+    try {
+      if (gain && ctx) {
+        const now = ctx.currentTime;
+        gain.gain.cancelScheduledValues(now);
+        gain.gain.setValueAtTime(Math.max(0.0001, gain.gain.value), now);
+        gain.gain.linearRampToValueAtTime(0.0001, now + 0.05);
+      }
+    } catch {
+      // already stopped
+    }
+    window.setTimeout(() => {
       try {
-        if (typeof (node as OscillatorNode).stop === 'function' && node instanceof OscillatorNode) {
-          node.stop();
-        }
-        node.disconnect();
+        src?.stop();
       } catch {
         // already stopped
       }
-    }
+      try {
+        src?.disconnect();
+        gain?.disconnect();
+      } catch {
+        // already disconnected
+      }
+    }, 70);
   }
 
   /**

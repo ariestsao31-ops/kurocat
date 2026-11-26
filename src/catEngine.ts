@@ -9,8 +9,10 @@ import {
 } from './keyboardLayout';
 import { catAudio } from './audio';
 import {
+  HANDOVER_PRESS_X_2D,
   HANDOVER_X_2D,
   handoverInvolvesDafeiyu,
+  handoverPlaceX,
   sampleHandover,
   type HandoverActorPose,
   type HandoverFrame,
@@ -1067,17 +1069,23 @@ export class KuroCatEngine {
     };
     this.assignBreedFields(skin.id, skin);
     this.handoverVis = pose;
-    this.headTilt = pose.arch * 0.5;
-    this.faceTurnX = pose.facing * 16;
-    this.typingHunch = pose.arch * 0.85;
-    this.earPerkSpring.x = -0.78 * pose.glare;
+    // Cock the head toward the rival; the canvas lean below swings the forehead into the press.
+    this.headTilt = pose.facing * pose.arch * 0.95;
+    this.faceTurnX = pose.facing * (8 + pose.arch * 22);
+    this.typingHunch = pose.arch * 0.95;
+    this.earPerkSpring.x = -0.92 * pose.glare;
     this.earPerkSpring.v = 0;
     ctx.save();
     const bob = Math.sin(pose.gait * Math.PI * 2) * 5.5 * pose.walking;
-    ctx.translate(pose.x * HANDOVER_X_2D, bob - pose.stand * 14);
-    ctx.translate(this.catCenterX, this.catBaseY);
-    ctx.rotate(Math.sin(pose.gait * Math.PI * 2) * 0.035 * pose.walking);
-    ctx.translate(-this.catCenterX, -this.catBaseY);
+    const headX = this.catCenterX;
+    const headY = this.catTopY + this.catHeight * 0.18;
+    // Stay upright. A small lean plus the head cock above is the 2D stand-in for a side-on turn;
+    // a full canvas rotation tips the typist sprite onto its side.
+    ctx.translate(handoverPlaceX(pose, HANDOVER_PRESS_X_2D) * HANDOVER_X_2D, bob - pose.stand * 10);
+    ctx.translate(headX, headY);
+    ctx.rotate(pose.facing * pose.arch * 0.34 + Math.sin(pose.gait * Math.PI * 2) * 0.03 * pose.walking);
+    ctx.scale(1 - pose.arch * 0.22, 1);
+    ctx.translate(-headX, -headY);
     try {
       if (skin.id === 'dafeiyu') {
         const now = performance.now();
