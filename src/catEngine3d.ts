@@ -20,6 +20,7 @@ import {
   sampleHandover,
   type HandoverActorPose,
 } from './catHandover';
+import { SideStandCat3D } from './standoffCat3d';
 import {
   FurShaderSystem,
   resolveFurPalette3D,
@@ -869,6 +870,8 @@ export class KuroCatEngine3D {
   private hvIncoming: HandoverActorPose | null = null;
   private hvOutgoing: HandoverActorPose | null = null;
   private outgoing: OutgoingActor | null = null;
+  private sideIncoming: SideStandCat3D | null = null;
+  private sideOutgoing: SideStandCat3D | null = null;
   private currentPalette: FurPalette3D | null = null;
   private renderStyle: RenderStyle3D = '3d';
   private collarId: CollarColorId = 'none';
@@ -2505,33 +2508,47 @@ export class KuroCatEngine3D {
     }
     if (this.handover) {
       if (to.id === this.handover.from.id) {
-        const back = this.handover.from;
+        this.handover.to = this.handover.from;
         this.finishHandover();
-        this.setCatSkin(back);
         return;
       }
       this.handover.to = to;
       this.handover.audio = audio;
-      this.setCatSkin(to);
+      this.sideIncoming?.dispose();
+      this.sideIncoming = this.spawnSideCat(to);
       this.lastInput = this.elapsed;
       this.wakeRendering();
       return;
     }
-    const actor = this.captureOutgoingActor();
-    if (!actor) {
-      this.setCatSkin(to);
-      return;
-    }
-    this.outgoing = actor;
-    this.scene.add(actor.group);
     this.handover = { t0: this.elapsed, from, to, audio };
-    this.setCatSkin(to);
+    this.sideOutgoing = this.spawnSideCat(from);
+    this.sideOutgoing.group.visible = false;
+    this.sideIncoming = this.spawnSideCat(to);
     this.lastInput = this.elapsed;
     this.wakeRendering();
   }
 
+  private spawnSideCat(skin: CatSkinConfig): SideStandCat3D {
+    const cat = new SideStandCat3D(skin);
+    this.scene.add(cat.group);
+    return cat;
+  }
+
+  /** The seated typist is wide. Hide it for the whole 3D handover so it cannot clip. */
+  private setTypistBodyVisible(visible: boolean): void {
+    this.catRoot.visible = visible;
+    this.tailLimb.fill.mesh.visible = visible;
+    for (const cap of this.tailLimb.caps) cap.visible = visible;
+    for (const arm of this.arms) {
+      arm.limb.fill.mesh.visible = visible;
+      for (const cap of arm.limb.caps) cap.visible = visible;
+      arm.paw.visible = visible;
+    }
+  }
+
   private finishHandover(): void {
     const audio = this.handover?.audio === true;
+    const nextSkin = this.handover?.to;
     const actor = this.outgoing;
     this.handover = null;
     this.hvIncoming = null;
@@ -2542,7 +2559,14 @@ export class KuroCatEngine3D {
       this.scene.remove(actor.group);
       disposeHandoverGraph(actor.group);
     }
-    this.catRoot.rotation.y = 0;
+    this.sideIncoming?.dispose();
+    this.sideOutgoing?.dispose();
+    this.sideIncoming = null;
+    this.sideOutgoing = null;
+    this.catRoot.rotation.set(0, 0, 0);
+    this.catRoot.scale.setScalar(0.9);
+    if (nextSkin) this.setCatSkin(nextSkin);
+    this.setTypistBodyVisible(true);
   }
 
   private tickHandover(): void {
@@ -4740,6 +4764,13 @@ export class KuroCatEngine3D {
       }
     }
 
-    if (this.hvOutgoing) this.applyOutgoingPose(this.hvOutgoing);
+    if (this.sideIncoming && this.hvIncoming) this.sideIncoming.place(this.hvIncoming);
+    if (this.sideOutgoing && this.hvOutgoing) {
+      this.sideOutgoing.place(this.hvOutgoing);
+      // Keep the real typist seated until it stands and turns into the side-on pose.
+      const turned = this.hvOutgoing.stand > 0.45 || this.hvOutgoing.arch > 0.12;
+      this.sideOutgoing.group.visible = turned;
+      this.setTypistBodyVisible(!turned);
+    }
   }
 }
